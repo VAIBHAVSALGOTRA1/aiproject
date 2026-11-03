@@ -1,3 +1,5 @@
+
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -332,6 +334,13 @@ def update_prediction_history(data, prediction, probability):
                 if column not in history.columns:
                     history[column] = np.nan
             history = history[columns]
+
+            # CSV files containing only blank Actual Direction values may
+            # be read by pandas as float64. Convert text columns to object
+            # so values such as UP, DOWN, Correct and Incorrect can be saved.
+            history["Actual Direction"] = history["Actual Direction"].astype("object")
+            history["Result"] = history["Result"].astype("object")
+            history["Predicted Direction"] = history["Predicted Direction"].astype("object")
         else:
             history = pd.DataFrame(columns=columns)
 
