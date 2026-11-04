@@ -311,103 +311,155 @@ def evaluate_model(y_test, predictions):
 # PREDICTION HISTORY
 # ==================================================
 
+HISTORY_COLUMNS = [
+    "Source Date",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Predicted Direction",
+    "Probability UP (%)",
+    "Probability DOWN (%)",
+    "Actual Direction",
+    "Result"
+]
+
+
+def _load_prediction_history():
+    """Load history safely and standardize its columns and data types."""
+    if HISTORY_FILE.exists():
+        history = pd.read_csv(HISTORY_FILE)
+    else:
+        history = pd.DataFrame(columns=HISTORY_COLUMNS)
+
+    for column in HISTORY_COLUMNS:
+        if column not in history.columns:
+            history[column] = np.nan
+
+    history = history[HISTORY_COLUMNS].copy()
+    history["Source Date"] = pd.to_datetime(
+        history["Source Date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    for column in [
+        "Predicted Direction", "Actual Direction", "Result"
+    ]:
+        history[column] = history[column].astype("object")
+
+    history = history.dropna(subset=["Source Date"])
+    history = history.drop_duplicates(subset=["Source Date"], keep="last")
+    return history.reset_index(drop=True)
+
+
 def update_prediction_history(data, prediction, probability):
     """
-    Save one prediction for each completed market-data date.
-    When the next trading day's close becomes available, mark
-    the previous prediction as correct or incorrect.
+    Maintain one genuine recorded prediction per trading date.
+
+    Existing history is preserved; missing dates are NOT reconstructed.
+    OHLC values are backfilled wherever market data is available, and actual
+    outcomes are resolved from the next trading session's closing price.
     """
-    columns = [
-        "Source Date",
-        "Source Close",
-        "Predicted Direction",
-        "Probability UP (%)",
-        "Probability DOWN (%)",
-        "Actual Direction",
-        "Result"
-    ]
-
     try:
-        if HISTORY_FILE.exists():
-            history = pd.read_csv(HISTORY_FILE)
-            for column in columns:
-                if column not in history.columns:
-                    history[column] = np.nan
-            history = history[columns]
+        history = _load_prediction_history()
 
-            # CSV files containing only blank Actual Direction values may
-            # be read by pandas as float64. Convert text columns to object
-            # so values such as UP, DOWN, Correct and Incorrect can be saved.
-            history["Actual Direction"] = history["Actual Direction"].astype("object")
-            history["Result"] = history["Result"].astype("object")
-            history["Predicted Direction"] = history["Predicted Direction"].astype("object")
-        else:
-            history = pd.DataFrame(columns=columns)
+        market_data = data.copy().sort_index()
+        market_data = market_data[~market_data.index.duplicated(keep="last")]
+        market_data.index = pd.to_datetime(market_data.index)
 
-        # Resolve earlier predictions using the next available trading session.
-        date_to_close = {
-            pd.Timestamp(index).date().isoformat(): float(row["Close"])
-            for index, row in data.iterrows()
+        # Backfill OHLC values for older history rows created before the
+        # OHLC columns were added. This uses the downloaded market dataset.
+        market_dates = {
+            pd.Timestamp(index).date().isoformat(): row
+            for index, row in market_data.iterrows()
         }
-
         for row_index, row in history.iterrows():
             source_date = str(row["Source Date"])[:10]
+            market_row = market_dates.get(source_date)
+            if market_row is not None:
+                for column in ["Open", "High", "Low", "Close"]:
+                    history.at[row_index, column] = float(market_row[column])
 
-            if pd.notna(row["Actual Direction"]):
-                continue
+        # Do not create predictions for dates when the application was not
+        # actually recording them. Existing historical rows remain untouched.
 
-            later_dates = sorted(
-                date_string
-                for date_string in date_to_close
-                if date_string > source_date
-            )
+        # Save or refresh the latest date's prediction using the current
+        # full-history model. Do not overwrite an existing resolved outcome.
+        latest_date = pd.Timestamp(market_data.index[-1]).date().isoformat()
+        latest_row = market_data.iloc[-1]
 
-            if source_date in date_to_close and later_dates:
-                next_date = later_dates[0]
-                actual = (
-                    "UP"
-                    if date_to_close[next_date] > date_to_close[source_date]
-                    else "DOWN"
-                )
-                predicted = str(row["Predicted Direction"])
-                history.at[row_index, "Actual Direction"] = actual
-                history.at[row_index, "Result"] = (
-                    "Correct" if predicted == actual else "Incorrect"
-                )
-
-        latest_date = pd.Timestamp(data.index[-1]).date().isoformat()
-        latest_close = float(data["Close"].iloc[-1])
-
-        existing = history.index[
-            history["Source Date"].astype(str).str[:10] == latest_date
-        ].tolist()
-
-        new_values = {
+        latest_values = {
             "Source Date": latest_date,
-            "Source Close": latest_close,
+            "Open": float(latest_row["Open"]),
+            "High": float(latest_row["High"]),
+            "Low": float(latest_row["Low"]),
+            "Close": float(latest_row["Close"]),
             "Predicted Direction": prediction,
             "Probability UP (%)": round(float(probability[1]) * 100, 2),
-            "Probability DOWN (%)": round(float(probability[0]) * 100, 2),
-            "Actual Direction": np.nan,
-            "Result": "Pending"
+            "Probability DOWN (%)": round(float(probability[0]) * 100, 2)
         }
 
+        existing = history.index[
+            history["Source Date"].astype(str) == latest_date
+        ].tolist()
+
         if existing:
-            # Refresh today's prediction if the model is recalculated.
-            for key, value in new_values.items():
-                if key not in ["Actual Direction", "Result"]:
-                    history.at[existing[-1], key] = value
+            row_index = existing[-1]
+            for key, value in latest_values.items():
+                history.at[row_index, key] = value
+            if pd.isna(history.at[row_index, "Actual Direction"]):
+                history.at[row_index, "Result"] = "Pending"
         else:
+            latest_values["Actual Direction"] = np.nan
+            latest_values["Result"] = "Pending"
             history = pd.concat(
-                [history, pd.DataFrame([new_values])],
+                [history, pd.DataFrame([latest_values])],
                 ignore_index=True
             )
 
-        history.to_csv(HISTORY_FILE, index=False)
+        # Resolve every prediction for which the next trading session is
+        # now present in the downloaded market data.
+        date_to_close = {
+            pd.Timestamp(index).date().isoformat(): float(close)
+            for index, close in market_data["Close"].items()
+        }
+        ordered_dates = sorted(date_to_close)
+
+        for row_index, row in history.iterrows():
+            source_date = str(row["Source Date"])[:10]
+            if source_date not in date_to_close:
+                continue
+
+            source_position = ordered_dates.index(source_date)
+            if source_position + 1 >= len(ordered_dates):
+                history.at[row_index, "Actual Direction"] = np.nan
+                history.at[row_index, "Result"] = "Pending"
+                continue
+
+            next_date = ordered_dates[source_position + 1]
+            actual = (
+                "UP"
+                if date_to_close[next_date] > date_to_close[source_date]
+                else "DOWN"
+            )
+            predicted = str(row["Predicted Direction"]).strip().upper()
+
+            history.at[row_index, "Actual Direction"] = actual
+            history.at[row_index, "Result"] = (
+                "Correct" if predicted == actual else "Incorrect"
+            )
+
+        history = history.sort_values("Source Date", ascending=False)
+        history = history[HISTORY_COLUMNS].reset_index(drop=True)
+
+        # Write atomically to reduce the chance of a partially written CSV.
+        temporary_file = HISTORY_FILE.with_suffix(".tmp")
+        history.to_csv(temporary_file, index=False)
+        temporary_file.replace(HISTORY_FILE)
+
         return history, None
 
     except Exception as error:
-        return pd.DataFrame(columns=columns), str(error)
+        return pd.DataFrame(columns=HISTORY_COLUMNS), str(error)
 
 
 # ==================================================
@@ -448,6 +500,14 @@ latest = data.iloc[-1]
 previous = data.iloc[-2]
 latest_date = pd.Timestamp(data.index[-1]).date()
 latest_close = float(latest["Close"])
+
+# Update prediction history on every app visit, regardless of the selected page.
+# This prevents history from depending on whether the user opens Daily Prediction.
+history, history_error = update_prediction_history(
+    data,
+    "UP" if latest_prediction == 1 else "DOWN",
+    latest_probability
+)
 
 
 # ==================================================
@@ -558,12 +618,6 @@ elif page == "Daily Prediction":
     ind_col2.metric("MACD", f"{float(latest['MACD']):.2f}")
     ind_col3.metric("20-day volatility", f"{float(latest['Volatility']):.2f}")
 
-    history, history_error = update_prediction_history(
-        data,
-        "UP" if latest_prediction == 1 else "DOWN",
-        latest_probability
-    )
-
     st.subheader("Daily Prediction History")
 
     if history_error:
@@ -572,14 +626,22 @@ elif page == "Daily Prediction":
             f"updated: {history_error}"
         )
     elif not history.empty:
-        st.dataframe(
-            history.sort_values("Source Date", ascending=False),
-            use_container_width=True
-        )
+        # Show only the latest 10 trading-date records in the dashboard.
+        # The complete history remains saved in prediction_history.csv.
+        display_history = history.sort_values(
+            "Source Date", ascending=False
+        ).head(10).copy()
+        for price_column in ["Open", "High", "Low", "Close"]:
+            display_history[price_column] = pd.to_numeric(
+                display_history[price_column], errors="coerce"
+            ).round(2)
+        st.dataframe(display_history, use_container_width=True)
         st.caption(
-            "A prediction is marked Correct or Incorrect after the next "
-            "trading session's closing data becomes available. History is "
-            "saved in prediction_history.csv beside this Python file."
+            "Showing the latest 10 trading days only. All historical records "
+            "are retained in prediction_history.csv. Predictions are recorded "
+            "when the application runs; missing dates are not reconstructed. "
+            "Actual direction is calculated using the next trading session's "
+            "closing price. Overall model-history records are preserved."
         )
     else:
         st.write("Prediction history will appear here.")
